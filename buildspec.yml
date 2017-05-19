@@ -1,0 +1,18 @@
+version: 0.2
+
+phases:
+  pre_build:
+    commands:
+      - mkdir mmds
+      - mv * mmds/ || true
+      - mkdir src
+      - mv mmds src
+  build:
+    commands:
+      - export GOPATH=${CODEBUILD_SRC_DIR}
+      - go get -v mmds
+
+artifacts:
+  discard-paths: yes
+  files: 
+  - bin/mmds
