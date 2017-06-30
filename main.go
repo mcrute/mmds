@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -28,6 +29,17 @@ import (
 var (
 	DEFAULT_VALUES map[string]*string
 )
+
+const (
+	METADATA_FILE = "/etc/mmds/bootstrap-cred.json"
+)
+
+type FileLike interface {
+	io.Reader
+	io.Writer
+	io.Seeker
+	Truncate(int64) error
+}
 
 func init() {
 	DEFAULT_VALUES = map[string]*string{
@@ -60,6 +72,7 @@ type appContext struct {
 	RoleARN           *string
 	BootstrapSecret   *string
 	CredentialHandler CredentialHandler
+	CredentialFile    FileLike
 }
 
 func (c *appContext) FormatAZ() string {
@@ -139,6 +152,7 @@ func BootstrapCredentialHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		jww.ERROR.Printf("Error decoding bootstrap JSON: %s", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
 	if !validateSignature(&cred, ctx.BootstrapSecret) {
@@ -149,6 +163,19 @@ func BootstrapCredentialHandler(w http.ResponseWriter, r *http.Request) {
 
 	creds := credentials.NewStaticCredentials(cred.AccessKeyId, cred.SecretAccessKey, cred.Token)
 	ctx.CredentialHandler.SetBootstrapCredential(creds)
+
+	jd, err := json.MarshalIndent(cred, "", " ")
+	if err != nil {
+		jww.ERROR.Printf("Unable to marshal credential for writing to file")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Truncate credential file and update with new credentials
+	// TODO: Should validate the the credentials worked first
+	ctx.CredentialFile.Seek(0, 0)
+	ctx.CredentialFile.Truncate(0)
+	ctx.CredentialFile.Write(jd)
 }
 
 func IAMInfoHandler(w http.ResponseWriter, r *http.Request) {
@@ -295,8 +322,8 @@ func parseArgs() (*UserArgs, error) {
 	return a, nil
 }
 
-func initialBootstrap(file string, handler CredentialHandler) {
-	bd, err := ioutil.ReadFile(file)
+func initialBootstrap(file FileLike, handler CredentialHandler) {
+	bd, err := ioutil.ReadAll(file)
 	if err != nil {
 		jww.ERROR.Printf("Error reading bootstrap file: %s", err.Error())
 		return
@@ -330,6 +357,16 @@ func main() {
 		return
 	}
 
+	// Open this before dropping privileges because only root can update the
+	// file but the service may need to update it at some future point if a new
+	// credential is provided.
+	credfile, err := os.OpenFile(METADATA_FILE, os.O_RDWR, 0600)
+	if err != nil {
+		jww.FATAL.Printf("Unable to open bootstrap credential file")
+		return
+	}
+	defer credfile.Close()
+
 	if err := drop.DropPrivileges(args.User); err != nil {
 		jww.FATAL.Printf("Unable to drop privileges")
 		return
@@ -362,9 +399,10 @@ func main() {
 		RoleARN:           &args.RoleARN,
 		BootstrapSecret:   &args.BootstrapSecret,
 		CredentialHandler: credHandler,
+		CredentialFile:    credfile,
 	}
 
-	initialBootstrap("/etc/mmds/bootstrap-cred.json", credHandler)
+	initialBootstrap(credfile, credHandler)
 
 	go credHandler.Start()
 	go http.ListenAndServe(":8000", buildAdminHandler(ctx))
